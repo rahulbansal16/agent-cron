@@ -12,33 +12,42 @@ agent-cron rm 3
 
 ## Install
 
-Requires macOS and Python 3.
+One command (macOS, Python 3). It installs the CLI, the launchd scheduler and the Claude Code skill:
 
 ```bash
-git clone https://github.com/rahulbansal16/agent-cron.git ~/agent-cron
-cd ~/agent-cron
-mkdir -p ~/.local/bin
-ln -sf "$PWD/agent-cron" ~/.local/bin/agent-cron   # ~/.local/bin must be on your PATH
-agent-cron install                                 # launchd agent that ticks every 60s
-python3 test_agent_cron.py                         # optional self-check, prints "ok"
+curl -fsSL https://raw.githubusercontent.com/rahulbansal16/agent-cron/main/install.sh | sh
 ```
+
+What it does, all idempotent (re-run it to update):
+
+1. Clones the repo to `~/.local/share/agent-cron-src` (or pulls if already there).
+2. Links `agent-cron` into `~/.local/bin` (make sure that is on your `PATH`).
+3. Runs `agent-cron install`, a launchd agent that ticks every 60s.
+4. Links the skill into `~/.claude/skills/agent-cron`.
+
+Then start a new Claude Code session and ask *"what's scheduled in agent-cron?"*. The skill lets Claude schedule jobs and, in any later session, check what's scheduled, whether it ran and what it printed.
 
 `agent-cron uninstall` removes the launchd agent. Jobs and history are stored in `~/.agent-cron/jobs.db`.
 
-## Add it to Claude Code
-
-### 1. Install the skill
-
-The skill tells Claude when and how to use `agent-cron`, e.g. when you say "run this at 9am" or "check back in 2 hours".
+<details>
+<summary>Manual install</summary>
 
 ```bash
-mkdir -p ~/.claude/skills
+git clone https://github.com/rahulbansal16/agent-cron.git ~/agent-cron
+mkdir -p ~/.local/bin ~/.claude/skills
+ln -sf ~/agent-cron/agent-cron ~/.local/bin/agent-cron
 ln -sfn ~/agent-cron/skill ~/.claude/skills/agent-cron
+agent-cron install
+python3 ~/agent-cron/test_agent_cron.py   # optional self-check, prints "ok"
 ```
 
-Restart Claude Code (or start a new session). `agent-cron` should now appear in the skill list, and you can call it directly with `/agent-cron`.
+</details>
 
-### 2. Allow the command without permission prompts (optional)
+## Claude Code setup (optional extras)
+
+The installer already adds the skill. Two optional tweaks:
+
+### Allow the command without permission prompts
 
 Add this to `~/.claude/settings.json` so Claude can call `agent-cron` without asking every time:
 
@@ -52,7 +61,7 @@ Add this to `~/.claude/settings.json` so Claude can call `agent-cron` without as
 
 Merge it into your existing `permissions.allow` list if you already have one. Note that this also lets Claude *schedule* commands without asking, and those commands run later without further prompts. Leave it out if you want to approve each job.
 
-### 3. Tell Claude it exists (optional)
+### Tell Claude it exists
 
 The skill is usually enough. To make Claude reach for it more consistently, add this to `~/.claude/CLAUDE.md`:
 
@@ -68,7 +77,7 @@ Ask Claude:
 
 > Schedule `echo hello` to run in 1 minute, then show me its result once it has run.
 
-Claude should run `agent-cron add --in 1m -- echo hello` and, after a minute, `agent-cron runs <id>`.
+Claude should run `agent-cron add --in 1m -- echo hello` and, after a minute, `agent-cron runs <id>`. In a new session, *"did my hello job run?"* should find it again via `agent-cron list --all`.
 
 ## How it works
 
