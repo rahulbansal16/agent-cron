@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""agent-cron: schedule shell commands (one-shot or cron) and record their results.
+
+  agent-cron add --at "2026-09-26 09:00" -- <command...>
+  agent-cron add --in 30m -- <command...>
+  agent-cron add --cron "*/15 * * * *" --name sync -- <command...>
+  agent-cron list [--all] [--json]
+  agent-cron runs [JOB_ID] [-n 10] [--json]
+  agent-cron rm JOB_ID
+  agent-cron run JOB_ID          # run now, in foreground
+  agent-cron tick                # run due jobs (launchd calls this every 60s)
+  agent-cron install|uninstall   # launchd agent
+"""
+import argparse, html, json, os, re, shlex, sqlite3, subprocess, sys, tempfile, time
+from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
+
+HOME = Path(os.environ.get("AGENT_CRON_HOME", Path.home() / ".agent-cron"))
+DB = HOME / "jobs.db"
+LABEL = "com.agent-cron.tick"
+PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+OUTPUT_CAP = 64_000  # bytes of output kept per run (tail)
+
+
+def db():
+    # commands and their output can hold secrets: keep the store owner-only
+    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(HOME, 0o700)
+    c = sqlite3.connect(DB, timeout=30)
+    os.chmod(DB, 0o600)
+    c.row_factory = sqlite3.Row
+    # AUTOINCREMENT: ids are never reused, so a stale worker can't touch a newer job/run
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS jobs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, command TEXT NOT NULL, cwd TEXT, path TEXT,
+      cron TEXT, next_run REAL, enabled INTEGER DEFAULT 1, created REAL);
+    CREATE TABLE IF NOT EXISTS runs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, started REAL, finished REAL,
+      status TEXT, exit_code INTEGER, output TEXT);
+    """)
+    return c
+
+
+# ---- cron: standard 5 fields, local time ----
+FIELDS = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+
+
+def parse_field(s, lo, hi):
+    out = set()
+    for part in s.split(","):
+        rng, _, step = part.partition("/")
+        if rng == "*":
+            a, b = lo, hi
+        elif "-" in rng:
+            a, b = map(int, rng.split("-"))
+        else:
+            a = b = int(rng)
+            if step:
+                b = hi
+        if not (lo <= a <= b <= hi):
+            raise ValueError(f"cron field out of range: {part}")
+        out.update(range(a, b + 1, int(step or 1)))
+    return out
+
+
+def parse_cron(expr):
+    parts = expr.split()
+    if len(parts) != 5:
+        raise ValueError("cron needs 5 fields: min hour dom month dow")
+    sets = [parse_field(p, lo, hi) for p, (lo, hi) in zip(parts, FIELDS)]
+    if 7 in sets[4]:
+        sets[4].add(0)
+    # a "*"-prefixed day field (e.g. "*/1") is unrestricted for the dom/dow OR rule, as in vixie cron
+    return sets, not parts[2].startswith("*"), not parts[4].startswith("*")
+
+
+def next_cron(expr, after):
+    (mins, hrs, doms, mons, dows), dom_r, dow_r = parse_cron(expr)
+    # Walk real epoch minutes and read local wall time for each, so DST is handled:
+    # a time in the spring-forward gap is skipped, one in the fall-back hour runs twice.
+    t = (int(after) // 60 + 1) * 60
+    end = after + 9 * 366 * 86400  # Feb 29 can be 8 years apart (2096 -> 2104)
+    while t < end:
+        d = datetime.fromtimestamp(t)
+        dom_ok, dow_ok = d.day in doms, (d.weekday() + 1) % 7 in dows
+        day_ok = (dom_ok or dow_ok) if (dom_r and dow_r) else (dom_ok and dow_ok)
+        if not (day_ok and d.month in mons):
+            # jump to next local midnight; max() guards zones where midnight falls in a DST gap
+            t = max(t + 60, int(datetime.combine(d.date() + timedelta(days=1), dtime()).timestamp()))
+        elif d.hour in hrs and d.minute in mins:
+            return float(t)
+        else:
+            t += 60  # at most 1440 steps: a matching day always has a matching minute
+    raise ValueError(f"cron never fires: {expr}")
+
+
+def parse_when(at=None, in_=None):
+    if in_:
+        m = re.fullmatch(r"(\d+)\s*([smhd])", in_.strip())
+        if not m:
+            raise ValueError("--in expects e.g. 90s, 10m, 2h, 1d")
+        return time.time() + int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
+    try:
+        return datetime.fromisoformat(at).timestamp()  # naive = local time
+    except ValueError:
+        raise ValueError('--at expects ISO time, e.g. "2026-09-26 09:00" or "2026-09-26T09:00:00+05:30"')
+
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else None
+
+
+def job_dict(r, c):
+    last = c.execute("SELECT status, exit_code, started FROM runs WHERE job_id=? ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+    return {"id": r["id"], "name": r["name"], "command": r["command"], "cwd": r["cwd"],
+            "schedule": r["cron"] or "once", "next_run": fmt(r["next_run"]) if r["enabled"] else None,
+            "enabled": bool(r["enabled"]),
+            "last_status": last["status"] if last else None,
+            "last_exit_code": last["exit_code"] if last else None,
+            "last_run": fmt(last["started"]) if last else None}
+
+
+# ---- execution ----
+def finish(c, run_id, code, out):
+    c.execute("UPDATE runs SET finished=?, status=?, exit_code=?, output=? WHERE id=?",
+              (time.time(), "ok" if code == 0 else "failed", code, out[-OUTPUT_CAP:], run_id))
+    c.commit()
+
+
+def execute(c, job_id, run_id=None):
+    """Run a job. With run_id, pick up the run that tick queued; otherwise start a fresh one."""
+    j = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not j:
+        sys.exit(f"no job {job_id}")
+    if run_id is None:
+        run_id = c.execute("INSERT INTO runs(job_id, started, status) VALUES(?,?, 'running')",
+                           (job_id, time.time())).lastrowid
+    elif not c.execute("UPDATE runs SET started=?, status='running' WHERE id=? AND job_id=? AND status='queued'",
+                       (time.time(), run_id, job_id)).rowcount:
+        return None, ""  # run was deleted (job rm'd) or already picked up
+    c.commit()
+    env = {**os.environ, "PATH": j["path"] or os.environ.get("PATH", ""), "AGENT_CRON_JOB_ID": str(job_id)}
+    try:
+        # output goes to a temp file, not memory, so a noisy job can't exhaust RAM; only the tail is kept
+        with tempfile.TemporaryFile() as f:
+            code = subprocess.run(j["command"], shell=True, cwd=j["cwd"] or None, env=env,
+                                  stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode
+            f.seek(max(0, f.tell() - OUTPUT_CAP))
+            out = f.read().decode(errors="replace")
+    except Exception as e:  # e.g. cwd deleted
+        code, out = -1, f"agent-cron: failed to start: {e}"
+    finish(c, run_id, code, out)
+    return code, out
+
+
+def tick(c):
+    now = time.time()
+    for j in c.execute("SELECT * FROM jobs WHERE enabled=1 AND next_run<=?", (now,)).fetchall():
+        try:
+            nxt, enabled, err = (next_cron(j["cron"], now), 1, None) if j["cron"] else (j["next_run"], 0, None)
+        except ValueError as e:  # a bad schedule disables only its own job, never the whole tick
+            nxt, enabled, err = j["next_run"], 0, str(e)
+        # claim: the conditional update succeeds for exactly one of any overlapping ticks
+        if not c.execute("UPDATE jobs SET next_run=?, enabled=? WHERE id=? AND enabled=1 AND next_run=?",
+                         (nxt, enabled, j["id"], j["next_run"])).rowcount:
+            c.rollback()
+            continue
+        # the queued run commits with the claim, so a failed spawn still leaves a visible record
+        run_id = c.execute("INSERT INTO runs(job_id, started, status) VALUES(?,?, 'queued')",
+                           (j["id"], now)).lastrowid
+        c.commit()
+        if err:
+            finish(c, run_id, -1, f"agent-cron: job disabled: {err}")
+            continue
+        try:
+            # detached child so a long job doesn't block other jobs or the next tick
+            subprocess.Popen([sys.executable, os.path.realpath(__file__), "_exec", str(j["id"]), str(run_id)],
+                             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            finish(c, run_id, -1, f"agent-cron: failed to spawn: {e}")
+
+
+# ---- launchd ----
+def install():
+    PLIST.parent.mkdir(parents=True, exist_ok=True)
+    HOME.mkdir(parents=True, exist_ok=True)
+    # the tick must see the same store (and timezone) as the CLI that installed it
+    env = {"AGENT_CRON_HOME": str(HOME), **({"TZ": os.environ["TZ"]} if "TZ" in os.environ else {})}
+    s = lambda v: f"<string>{html.escape(str(v))}</string>"  # not plistlib: it needs pyexpat, broken on some Homebrew Pythons
+    PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key>{s(LABEL)}
+  <key>ProgramArguments</key><array>{s(sys.executable)}{s(os.path.realpath(__file__))}{s("tick")}</array>
+  <key>EnvironmentVariables</key><dict>{"".join(f"<key>{k}</key>{s(v)}" for k, v in env.items())}</dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key>{s(HOME / "tick.err.log")}
+</dict></plist>
+""")
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"], stderr=subprocess.DEVNULL)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST)], check=True)
+    print(f"installed {PLIST} (ticks every 60s)")
+
+
+def uninstall():
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], stderr=subprocess.DEVNULL)
+    PLIST.unlink(missing_ok=True)
+    print("uninstalled")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agent-cron", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("add", help="schedule a command (put it after --)")
+    g = a.add_mutually_exclusive_group(required=True)
+    g.add_argument("--at", help='one-shot, local ISO time: "2026-09-26 09:00"')
+    g.add_argument("--in", dest="in_", help="one-shot, relative: 90s, 10m, 2h, 1d")
+    g.add_argument("--cron", help='recurring, 5-field cron: "0 9 * * 1-5"')
+    a.add_argument("--name")
+    a.add_argument("--cwd", default=os.getcwd(), help="working dir (default: current)")
+    a.add_argument("--json", action="store_true")
+    a.add_argument("command", nargs=argparse.REMAINDER)
+    l = sub.add_parser("list", help="list scheduled jobs")
+    l.add_argument("--all", action="store_true", help="include finished/disabled jobs")
+    l.add_argument("--json", action="store_true")
+    r = sub.add_parser("runs", help="run history with status and output")
+    r.add_argument("job_id", nargs="?", type=int)
+    r.add_argument("-n", type=int, default=10)
+    r.add_argument("--json", action="store_true")
+    sub.add_parser("rm", help="delete a job and its history").add_argument("job_id", type=int)
+    sub.add_parser("run", help="run a job now (foreground)").add_argument("job_id", type=int)
+    sub.add_parser("tick")
+    e = sub.add_parser("_exec")
+    e.add_argument("job_id", type=int)
+    e.add_argument("run_id", type=int)
+    sub.add_parser("install")
+    sub.add_parser("uninstall")
+    args = ap.parse_args()
+    c = db()
+
+    try:
+        if args.cmd == "add":
+            cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
+            if not cmd:
+                ap.error("missing command after --")
+            command = cmd[0] if len(cmd) == 1 else shlex.join(cmd)
+            nxt = next_cron(args.cron, time.time()) if args.cron else parse_when(args.at, args.in_)
+            jid = c.execute("INSERT INTO jobs(name, command, cwd, path, cron, next_run, created) VALUES(?,?,?,?,?,?,?)",
+                            (args.name, command, os.path.abspath(args.cwd), os.environ.get("PATH"),
+                             args.cron, nxt, time.time())).lastrowid
+            c.commit()
+            j = job_dict(c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone(), c)
+            if nxt < time.time():
+                j["warning"] = "time is in the past; it will run on the next tick"
+            if not PLIST.exists():
+                j["warning"] = "scheduler not installed; run: agent-cron install"
+            print(json.dumps(j, indent=2) if args.json else
+                  f"job {jid} scheduled, next run {j['next_run']}" + (f"  ({j['warning']})" if "warning" in j else ""))
+
+        elif args.cmd == "list":
+            q = "SELECT * FROM jobs" + ("" if args.all else " WHERE enabled=1") + " ORDER BY next_run"
+            jobs = [job_dict(x, c) for x in c.execute(q).fetchall()]
+            if args.json:
+                print(json.dumps(jobs, indent=2))
+            elif not jobs:
+                print("no jobs")
+            for j in [] if args.json else jobs:
+                print(f"[{j['id']}] {j['name'] or ''} {j['schedule']}  next={j['next_run']}  "
+                      f"last={j['last_status']}({j['last_exit_code']})  $ {j['command']}")
+
+        elif args.cmd == "runs":
+            q, p = "SELECT * FROM runs", ()
+            if args.job_id:
+                q, p = q + " WHERE job_id=?", (args.job_id,)
+            rows = c.execute(q + " ORDER BY id DESC LIMIT ?", (*p, args.n)).fetchall()
+            out = [{"run_id": x["id"], "job_id": x["job_id"], "status": x["status"], "exit_code": x["exit_code"],
+                    "started": fmt(x["started"]), "finished": fmt(x["finished"]), "output": x["output"]} for x in rows]
+            if args.json:
+                print(json.dumps(out, indent=2))
+            elif not out:
+                print("no runs")
+            for x in [] if args.json else out:
+                print(f"--- run {x['run_id']} job {x['job_id']} {x['status']} exit={x['exit_code']} "
+                      f"{x['started']} -> {x['finished']}\n{(x['output'] or '').rstrip()[-2000:]}")
+
+        elif args.cmd == "rm":
+            n = c.execute("DELETE FROM jobs WHERE id=?", (args.job_id,)).rowcount
+            c.execute("DELETE FROM runs WHERE job_id=?", (args.job_id,))
+            c.commit()
+            print(f"deleted job {args.job_id}") if n else sys.exit(f"no job {args.job_id}")
+
+        elif args.cmd == "run":
+            code, out = execute(c, args.job_id)
+            print(out, end="")
+            sys.exit(code if 0 <= code < 256 else 1)
+        elif args.cmd == "_exec":
+            execute(c, args.job_id, args.run_id)
+        elif args.cmd == "tick":
+            tick(c)
+        elif args.cmd == "install":
+            install()
+        elif args.cmd == "uninstall":
+            uninstall()
+    except ValueError as e:
+        sys.exit(f"agent-cron: {e}")
+
+
+if __name__ == "__main__":
+    main()
