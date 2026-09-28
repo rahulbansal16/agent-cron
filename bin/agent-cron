@@ -11,7 +11,7 @@
   agent-cron tick                # run due jobs (launchd calls this every 60s)
   agent-cron install|uninstall   # launchd agent
 """
-import argparse, html, json, os, re, shlex, sqlite3, subprocess, sys, tempfile, time
+import argparse, html, json, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
@@ -181,6 +181,15 @@ def tick(c):
 
 
 # ---- launchd ----
+def runner():
+    """Copy of this script at a stable path for launchd. A plugin's install dir moves on every update."""
+    src, dst = Path(os.path.realpath(__file__)), HOME / "agent-cron"
+    if src != dst and (not dst.exists() or dst.read_bytes() != src.read_bytes()):
+        HOME.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    return dst
+
+
 def install():
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     HOME.mkdir(parents=True, exist_ok=True)
@@ -191,7 +200,7 @@ def install():
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key>{s(LABEL)}
-  <key>ProgramArguments</key><array>{s(sys.executable)}{s(os.path.realpath(__file__))}{s("tick")}</array>
+  <key>ProgramArguments</key><array>{s(sys.executable)}{s(runner())}{s("tick")}</array>
   <key>EnvironmentVariables</key><dict>{"".join(f"<key>{k}</key>{s(v)}" for k, v in env.items())}</dict>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
@@ -254,7 +263,9 @@ def main():
             j = job_dict(c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone(), c)
             if nxt < time.time():
                 j["warning"] = "time is in the past; it will run on the next tick"
-            if not PLIST.exists():
+            if PLIST.exists():
+                runner()  # keep the scheduler's copy in step with this CLI
+            else:
                 j["warning"] = "scheduler not installed; run: agent-cron install"
             print(json.dumps(j, indent=2) if args.json else
                   f"job {jid} scheduled, next run {j['next_run']}" + (f"  ({j['warning']})" if "warning" in j else ""))

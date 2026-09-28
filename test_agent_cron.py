@@ -2,7 +2,7 @@
 import importlib.machinery, importlib.util, json, os, stat, subprocess, tempfile, time
 from datetime import datetime
 here = os.path.dirname(os.path.abspath(__file__))
-loader = importlib.machinery.SourceFileLoader("ac", os.path.join(here, "agent-cron"))
+loader = importlib.machinery.SourceFileLoader("ac", os.path.join(here, "bin", "agent-cron"))
 spec = importlib.util.spec_from_loader("ac", loader); ac = importlib.util.module_from_spec(spec); loader.exec_module(ac)
 
 # --- cron math (Asia/Kolkata: no DST) ---
@@ -32,7 +32,7 @@ os.environ["TZ"] = "Asia/Kolkata"; time.tzset()
 # --- CLI end to end, isolated store ---
 home = tempfile.mkdtemp()
 env = {**os.environ, "AGENT_CRON_HOME": home}
-cli = lambda *a: subprocess.run([os.path.join(here, "agent-cron"), *a], env=env, capture_output=True, text=True)
+cli = lambda *a: subprocess.run([os.path.join(here, "bin", "agent-cron"), *a], env=env, capture_output=True, text=True)
 runs_of = lambda jid: json.loads(cli("runs", str(jid), "--json").stdout)
 
 def wait_done(jid):
@@ -61,7 +61,7 @@ cli("rm", str(j2["id"]))
 
 # overlapping ticks fire a due one-shot exactly once
 j = json.loads(cli("add", "--in", "0s", "--json", "--", "echo once").stdout)
-procs = [subprocess.Popen([os.path.join(here, "agent-cron"), "tick"], env=env) for _ in range(8)]
+procs = [subprocess.Popen([os.path.join(here, "bin", "agent-cron"), "tick"], env=env) for _ in range(8)]
 [p.wait() for p in procs]
 assert len(wait_done(j["id"])) == 1, runs_of(j["id"])
 
@@ -93,4 +93,8 @@ real_run(["plutil", "-lint", str(ac.PLIST)], check=True, capture_output=True)
 home_val = real_run(["plutil", "-extract", "EnvironmentVariables.AGENT_CRON_HOME", "raw", "-o", "-", str(ac.PLIST)],
                     capture_output=True, text=True, check=True).stdout
 assert home_val.rstrip("\n") == str(ac.HOME), home_val
+# launchd runs a stable copy, not the file that ran install (plugin dirs move on update)
+prog = real_run(["plutil", "-extract", "ProgramArguments.1", "raw", "-o", "-", str(ac.PLIST)],
+                capture_output=True, text=True, check=True).stdout.rstrip("\n")
+assert prog == str(ac.HOME / "agent-cron") and open(prog, "rb").read() == open(os.path.join(here, "bin", "agent-cron"), "rb").read()
 print("ok")

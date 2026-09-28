@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"agent-cron: jobs scheduled in earlier sessions persist here. For questions about scheduled jobs or their output, use the agent-cron skill (agent-cron list --all, agent-cron runs). Active jobs:\"; \"${CLAUDE_PLUGIN_ROOT}\"/bin/agent-cron list 2>/dev/null | head -20"
+          }
+        ]
+      }
+    ]
+  }
+}

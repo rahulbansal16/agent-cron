@@ -1,0 +1,15 @@
+{
+  "name": "agent-cron",
+  "owner": { "name": "Rahul Bansal", "url": "https://github.com/rahulbansal16" },
+  "metadata": { "description": "Marketplace for the agent-cron scheduler plugin." },
+  "plugins": [
+    {
+      "name": "agent-cron",
+      "description": "Schedule shell commands to run later or on a cron schedule on macOS, and check what ran in any later Claude session.",
+      "version": "0.1.0",
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/rahulbansal16/agent-cron"
+    }
+  ]
+}
