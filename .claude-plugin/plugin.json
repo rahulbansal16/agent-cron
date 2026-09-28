@@ -1,0 +1,10 @@
+{
+  "name": "agent-cron",
+  "version": "0.1.0",
+  "description": "Schedule shell commands to run later or on a cron schedule on macOS, and check what ran in any later Claude session.",
+  "author": { "name": "Rahul Bansal", "url": "https://github.com/rahulbansal16" },
+  "homepage": "https://github.com/rahulbansal16/agent-cron",
+  "repository": "https://github.com/rahulbansal16/agent-cron",
+  "license": "MIT",
+  "keywords": ["cron", "scheduler", "launchd", "macos", "automation"]
+}

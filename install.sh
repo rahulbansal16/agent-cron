@@ -17,7 +17,7 @@ command -v python3 >/dev/null 2>&1 || { echo "agent-cron: python3 required" >&2;
 
 # Running from inside a checkout? Use it. Otherwise clone or update the source.
 here="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
-if [ -n "$here" ] && [ -x "$here/agent-cron" ] && [ -d "$here/skill" ]; then
+if [ -n "$here" ] && [ -x "$here/agent-cron" ] && [ -d "$here/skills/agent-cron" ]; then
   SRC="$here"
 elif [ -d "$SRC/.git" ]; then
   git -C "$SRC" pull --ff-only --quiet
@@ -37,7 +37,7 @@ echo "linked   $BIN/agent-cron"
 
 # 3. Claude Code skill, so Claude can schedule and check jobs in any session
 mkdir -p "$SKILLS"
-ln -sfn "$SRC/skill" "$SKILLS/agent-cron"
+ln -sfn "$SRC/skills/agent-cron" "$SKILLS/agent-cron"
 echo "linked   $SKILLS/agent-cron (Claude Code skill)"
 
 case ":$PATH:" in

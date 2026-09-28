@@ -10,6 +10,17 @@ agent-cron runs 3 --json
 agent-cron rm 3
 ```
 
+## Install as a Claude Code plugin
+
+Works in the Claude Code CLI and the Code tab of the Claude desktop app:
+
+```
+/plugin marketplace add rahulbansal16/agent-cron
+/plugin install agent-cron@agent-cron
+```
+
+The plugin adds the skill. The first time you schedule something, Claude runs the installer below if the `agent-cron` CLI is missing.
+
 ## Install
 
 One command (macOS, Python 3). It installs the CLI, the launchd scheduler and the Claude Code skill:
@@ -36,7 +47,7 @@ Then start a new Claude Code session and ask *"what's scheduled in agent-cron?"*
 git clone https://github.com/rahulbansal16/agent-cron.git ~/agent-cron
 mkdir -p ~/.local/bin ~/.claude/skills
 ln -sf ~/agent-cron/agent-cron ~/.local/bin/agent-cron
-ln -sfn ~/agent-cron/skill ~/.claude/skills/agent-cron
+ln -sfn ~/agent-cron/skills/agent-cron ~/.claude/skills/agent-cron
 agent-cron install
 python3 ~/agent-cron/test_agent_cron.py   # optional self-check, prints "ok"
 ```
