@@ -1,13 +1,13 @@
 ---
 name: agent-cron
-description: Schedule shell commands to run later (one-shot or recurring cron) on this Mac, and check on scheduled jobs and their results. Use when asked to "run X at 9am", "check back in 2 hours", "run this every day", "what's scheduled?", "did my job run?", "show the output of the scheduled task", or to list, run or delete scheduled commands. Also use at the start of a follow-up session when the user refers to something scheduled earlier.
+description: Local scheduler on this Mac (agent-cron CLI) that persists jobs and their output across Claude sessions. Use it to schedule shell commands to run later or on a cron schedule ("run X at 9am", "check back in 2 hours", "run this every day"), and to answer any question about a job scheduled earlier, in this or a previous session ("what's scheduled?", "did my job run?", "did <job name> run?", "what did it print?"). Session cron tools only see this session; check `agent-cron list --all` before saying a job does not exist.
 ---
 
 # agent-cron
 
 Local scheduler backed by launchd (ticks every 60s). Jobs and run history live in `~/.agent-cron/jobs.db` and persist across Claude sessions, so a later session can check on jobs an earlier one scheduled. Jobs run with the `cwd` and `PATH` of whoever added them. Times are local.
 
-If `agent-cron` is not found, install it:
+The agent-cron plugin puts `agent-cron` on the PATH. If `add` warns "scheduler not installed", run `agent-cron install` once (it registers the launchd tick). If `agent-cron` is not found at all, install it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rahulbansal16/agent-cron/main/install.sh | sh
@@ -35,8 +35,7 @@ agent-cron rm JOB_ID              # delete job and its history
 ```
 
 - Always pass `--name` so the job is easy to find later.
-- Put the command after `--`. Shell syntax (pipes, `;`, `$(...)`) needs a single quoted argument.
+- Put the command after `--`, and every flag (including `--json`) before it. Everything after `--` becomes the command, so `add --in 1m -- echo hi --json` schedules `echo hi --json`. Shell syntax (pipes, `;`, `$(...)`) needs a single quoted argument.
 - After adding, tell the user the job id, name and next run time.
 - Use `--json` when you will parse the output.
-- If `add` warns "scheduler not installed", run `agent-cron install`.
 - Missed runs (Mac asleep) fire once on the next tick after wake. A cron job whose schedule can never fire is disabled, with the reason in `runs`.

@@ -19,7 +19,19 @@ Works in the Claude Code CLI and the Code tab of the Claude desktop app:
 /plugin install agent-cron@agent-cron
 ```
 
-The plugin adds the skill. The first time you schedule something, Claude runs the installer below if the `agent-cron` CLI is missing.
+The plugin brings everything Claude needs, with no separate install:
+
+- the `agent-cron` CLI, on the PATH of Claude's Bash tool
+- the skill that tells Claude how to schedule jobs and check on them
+- a session-start hook that lists active jobs, so a new session knows about jobs scheduled earlier
+
+The first time Claude schedules a job, the CLI warns that the scheduler isn't installed yet, and Claude runs `agent-cron install` to register the launchd tick. Then just ask:
+
+> Run `./backup.sh` every weekday at 9am.
+> Check PR #12's CI in 2 hours and tell me what failed.
+> Did my backup job run last night? What did it print?
+
+To use `agent-cron` from your own terminal as well, run the installer below.
 
 ## Install
 
@@ -46,7 +58,7 @@ Then start a new Claude Code session and ask *"what's scheduled in agent-cron?"*
 ```bash
 git clone https://github.com/rahulbansal16/agent-cron.git ~/agent-cron
 mkdir -p ~/.local/bin ~/.claude/skills
-ln -sf ~/agent-cron/agent-cron ~/.local/bin/agent-cron
+ln -sf ~/agent-cron/bin/agent-cron ~/.local/bin/agent-cron
 ln -sfn ~/agent-cron/skills/agent-cron ~/.claude/skills/agent-cron
 agent-cron install
 python3 ~/agent-cron/test_agent_cron.py   # optional self-check, prints "ok"
